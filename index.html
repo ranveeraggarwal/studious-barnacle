@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
+    <title>Soda Fountain Fluid Simulation</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23FF7D00'/></svg>" />
+  </head>
+  <body>
+    <div id="app" data-testid="app-root">
+      <header id="fountain-controls" data-testid="fountain-controls">
+        <div
+          class="drink-buttons-group"
+          role="group"
+          aria-label="Soda Fountain Dispensers"
+        >
+          <button
+            type="button"
+            class="drink-btn"
+            data-testid="drink-btn-coca-cola"
+            data-drink="coca-cola"
+            data-color="#3E160C"
+            data-active="false"
+            aria-pressed="false"
+          >
+            <span class="drink-swatch" style="background-color: #3E160C"></span>
+            <span class="drink-label">Coca-Cola</span>
+          </button>
+          <button
+            type="button"
+            class="drink-btn"
+            data-testid="drink-btn-fanta"
+            data-drink="fanta"
+            data-color="#FF7D00"
+            data-active="false"
+            aria-pressed="false"
+          >
+            <span class="drink-swatch" style="background-color: #FF7D00"></span>
+            <span class="drink-label">Fanta</span>
+          </button>
+          <button
+            type="button"
+            class="drink-btn"
+            data-testid="drink-btn-sprite"
+            data-drink="sprite"
+            data-color="#AAF5C3"
+            data-active="false"
+            aria-pressed="false"
+          >
+            <span class="drink-swatch" style="background-color: #AAF5C3"></span>
+            <span class="drink-label">Sprite</span>
+          </button>
+          <button
+            type="button"
+            class="drink-btn"
+            data-testid="drink-btn-cherry"
+            data-drink="cherry"
+            data-color="#E4183E"
+            data-active="false"
+            aria-pressed="false"
+          >
+            <span class="drink-swatch" style="background-color: #E4183E"></span>
+            <span class="drink-label">Cherry Soda</span>
+          </button>
+          <button
+            type="button"
+            class="drink-btn"
+            data-testid="drink-btn-berry-blue"
+            data-drink="berry-blue"
+            data-color="#0098FF"
+            data-active="false"
+            aria-pressed="false"
+          >
+            <span class="drink-swatch" style="background-color: #0098FF"></span>
+            <span class="drink-label">Blue Raspberry</span>
+          </button>
+        </div>
+
+        <div class="fountain-actions">
+          <div id="status-bar" data-testid="status-bar" aria-label="Glass Fill Status">
+            <span
+              id="mixed-color-swatch"
+              data-testid="mixed-color-swatch"
+              data-rgb="0,0,0"
+              data-fill-percent="0"
+            ></span>
+            <span id="fill-readout" data-testid="fill-readout">0%</span>
+          </div>
+          <button
+            type="button"
+            id="reset-btn"
+            data-testid="reset-button"
+            data-action="empty-glass"
+          >
+            Empty Glass
+          </button>
+        </div>
+      </header>
+
+      <canvas
+        id="fountain-canvas"
+        data-testid="fountain-canvas"
+        data-ready="false"
+        data-webgl-version="2"
+        data-glass-x="0.50"
+        data-fill-ratio="0.00"
+        data-avg-rgb="0,0,0"
+        data-active-drinks=""
+      ></canvas>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
