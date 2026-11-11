@@ -17,8 +17,8 @@ export default defineConfig({
     sourcemap: true,
   },
   test: {
-    include: ['tests/unit/**/*.test.ts'],
-    exclude: ['node_modules', 'dist', '.agents', 'tests/e2e/**'],
+    include: ['tests/**/*.test.ts'],
+    exclude: ['node_modules', 'dist', '.agents'],
     environment: 'node',
     globals: false,
   },

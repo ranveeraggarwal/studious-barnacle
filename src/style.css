@@ -1,233 +1,511 @@
+:root {
+  --bg-stage: #0c0f14;
+  --surface-hud: rgba(16, 20, 27, 0.86);
+  --border-subtle: rgba(255, 255, 255, 0.09);
+  --text-primary: #f1f5f9;
+  --text-muted: #94a3b8;
+  --font-sans: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
 *,
 *::before,
 *::after {
   box-sizing: border-box;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
-  width: 100%;
-  height: 100%;
   margin: 0;
   padding: 0;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
   overflow: hidden;
-  background-color: #12161f;
-  color: #f1f5f9;
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
-    sans-serif;
+  background-color: var(--bg-stage);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
   user-select: none;
   -webkit-user-select: none;
   -webkit-touch-callout: none;
+  touch-action: none;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-#app {
-  display: flex;
-  flex-direction: column;
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.fountain-app {
+  position: relative;
   width: 100vw;
   height: 100vh;
-  max-width: 100vw;
-  max-height: 100vh;
+  height: 100dvh;
   overflow: hidden;
+  touch-action: none;
 }
 
-#fountain-controls {
-  flex: 0 0 auto;
+.fountain-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+  outline: none;
+}
+
+.fountain-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 2;
+  --pad-scale: 1;
+  --wu: 1px;
+}
+
+/* ==========================================================================
+   Diegetic Dispenser Push-Pads (Mounted on Soda Fountain Fascia)
+   ========================================================================== */
+
+.dispenser-pad {
+  position: absolute;
+  appearance: none;
+  -webkit-appearance: none;
+  border: 0;
+  margin: 0;
+  padding: clamp(1.5px, calc(2.2 * var(--wu)), 3.2px);
+  border-radius: clamp(6px, calc(9.5 * var(--wu)), 14px);
+  background: #07090d;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  pointer-events: auto;
+  touch-action: none;
+  cursor: pointer;
+  outline: none;
+  -webkit-tap-highlight-color: transparent;
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.055),
+    inset 0 calc(2 * var(--wu)) calc(5 * var(--wu)) rgba(0, 0, 0, 0.92),
+    0 calc(3 * var(--wu)) calc(8 * var(--wu)) rgba(0, 0, 0, 0.42);
+}
+
+.dispenser-pad:focus-visible {
+  box-shadow:
+    0 0 0 2px rgba(241, 245, 249, 0.65),
+    inset 0 calc(2 * var(--wu)) calc(5 * var(--wu)) rgba(0, 0, 0, 0.92);
+}
+
+.pad-plate {
+  position: relative;
+  width: 100%;
+  height: 100%;
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
   align-items: center;
   justify-content: space-between;
-  gap: 6px 10px;
-  padding: 8px 12px;
-  background: linear-gradient(180deg, #1e2533 0%, #151b26 100%);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-  z-index: 10;
-  touch-action: none;
-  user-select: none;
-  -webkit-user-select: none;
-  max-width: 100%;
+  border-radius: clamp(4.5px, calc(7.6 * var(--wu)), 11.5px);
   overflow: hidden;
+  transform: translateY(calc(-1.2 * var(--wu)));
+  background:
+    repeating-linear-gradient(
+      90deg,
+      rgba(255, 255, 255, 0.015) 0px,
+      rgba(255, 255, 255, 0.015) 1px,
+      transparent 1px,
+      transparent 3px
+    ),
+    linear-gradient(180deg, #282f3a 0%, #1d222c 50%, #151922 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.55),
+    0 calc(3.2 * var(--wu)) 0 #0a0d12,
+    0 calc(5 * var(--wu)) calc(9 * var(--wu)) rgba(0, 0, 0, 0.55);
+  transition:
+    transform 75ms cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 90ms ease,
+    filter 110ms ease;
+  will-change: transform;
 }
 
-.drink-buttons-group {
+@media (hover: hover) and (pointer: fine) {
+  .dispenser-pad:not(.is-active):hover .pad-plate {
+    filter: brightness(1.09);
+  }
+}
+
+/* Physical 3D press-in depression when dispensing */
+.dispenser-pad.is-active .pad-plate {
+  transform: translateY(calc(1.9 * var(--wu)));
+  background:
+    radial-gradient(
+      92% 68% at 50% 100%,
+      color-mix(in srgb, var(--drink-glow, #ffffff) 22%, transparent) 0%,
+      transparent 76%
+    ),
+    repeating-linear-gradient(
+      90deg,
+      rgba(255, 255, 255, 0.012) 0px,
+      rgba(255, 255, 255, 0.012) 1px,
+      transparent 1px,
+      transparent 3px
+    ),
+    linear-gradient(180deg, #1a1f27 0%, #151921 56%, #11151c 100%);
+  box-shadow:
+    inset 0 calc(2.2 * var(--wu)) calc(5 * var(--wu)) rgba(0, 0, 0, 0.68),
+    inset 0 -1px 0 color-mix(in srgb, var(--drink-glow, #ffffff) 34%, transparent),
+    0 calc(0.6 * var(--wu)) 0 #080a0e,
+    0 calc(1.5 * var(--wu)) calc(4 * var(--wu)) rgba(0, 0, 0, 0.45);
+}
+
+/* Top flavor color cap / backlit acrylic bar */
+.pad-cap {
+  width: 100%;
+  height: clamp(6px, calc(12.5 * var(--wu)), 16px);
+  flex-shrink: 0;
+  background:
+    linear-gradient(
+      180deg,
+      rgba(255, 255, 255, 0.34) 0%,
+      rgba(255, 255, 255, 0.05) 46%,
+      rgba(0, 0, 0, 0.2) 100%
+    ),
+    var(--drink-color, #64748b);
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.5);
+  transition: filter 110ms ease;
+}
+
+.dispenser-pad.is-active .pad-cap {
+  filter: saturate(1.12) brightness(1.1);
+}
+
+/* Header row inside pad: desktop key hint + hands-free latch dot badge */
+.pad-meta {
+  width: 100%;
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
-  flex: 1 1 auto;
+  justify-content: space-between;
+  padding: calc(2.5 * var(--wu)) clamp(4px, calc(6.5 * var(--wu)), 9px) 0;
+  min-height: clamp(8px, calc(13 * var(--wu)), 17px);
+  pointer-events: none;
+}
+
+.pad-key {
+  font-family: var(--font-mono);
+  font-size: clamp(8px, calc(9.2 * var(--wu)), 11px);
+  font-weight: 500;
+  line-height: 1;
+  color: rgba(203, 213, 225, 0.46);
+  letter-spacing: -0.02em;
+}
+
+@media (hover: none) and (pointer: coarse) {
+  .pad-key {
+    visibility: hidden;
+  }
+}
+
+.fountain-overlay.is-compact .pad-key {
+  display: none;
+}
+
+.fountain-overlay.is-compact .pad-meta {
+  justify-content: flex-end;
+  min-height: 7px;
+  padding-top: 2px;
+}
+
+/* Tiny lock / continuous-flow badge when latched hands-free */
+.pad-latch-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: calc(2.8 * var(--wu));
+  padding: calc(1.4 * var(--wu)) clamp(3px, calc(4.2 * var(--wu)), 6px);
+  border-radius: 999px;
+  background: rgba(10, 13, 18, 0.78);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
+  opacity: 0;
+  transform: scale(0.72);
+  transition:
+    opacity 110ms ease,
+    transform 130ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.dispenser-pad.is-latched .pad-latch-badge {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.pad-latch-dot {
+  width: clamp(4.5px, calc(5.4 * var(--wu)), 7px);
+  height: clamp(4.5px, calc(5.4 * var(--wu)), 7px);
+  border-radius: 50%;
+  background: var(--drink-glow, #38bdf8);
+  box-shadow: 0 0 6px var(--drink-glow, #38bdf8);
+  animation: latchFlowPulse 1.25s ease-in-out infinite;
+}
+
+.pad-latch-text {
+  font-family: var(--font-mono);
+  font-size: clamp(6.5px, calc(7.4 * var(--wu)), 9px);
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.04em;
+  color: #f8fafc;
+}
+
+.fountain-overlay.is-compact .pad-latch-text {
+  display: none;
+}
+
+@keyframes latchFlowPulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.55;
+    transform: scale(0.82);
+  }
+}
+
+/* Crisp drink flavor label */
+.pad-label {
+  padding: 0 clamp(2px, calc(4.5 * var(--wu)), 7px);
+  font-size: clamp(9.2px, calc(12.2 * var(--wu)), 15.5px);
+  font-weight: 600;
+  line-height: 1.08;
+  letter-spacing: -0.018em;
+  text-align: center;
+  color: #eef2f7;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.65);
+  pointer-events: none;
+  overflow-wrap: break-word;
+}
+
+.dispenser-pad.is-active .pad-label {
+  color: #ffffff;
+}
+
+/* Bottom recessed LED nozzle indicator */
+.pad-led {
+  width: 46%;
+  height: clamp(3px, calc(4.2 * var(--wu)), 5.5px);
+  margin-bottom: clamp(4px, calc(7.2 * var(--wu)), 10px);
+  border-radius: 999px;
+  flex-shrink: 0;
+  background: #0a0d12;
+  box-shadow:
+    inset 0 1px 1.5px rgba(0, 0, 0, 0.9),
+    0 1px 0 rgba(255, 255, 255, 0.06);
+  transition:
+    background-color 90ms ease,
+    box-shadow 110ms ease;
+  pointer-events: none;
+}
+
+.dispenser-pad.is-active .pad-led {
+  background: var(--drink-glow, #ffffff);
+  box-shadow:
+    0 0 calc(8 * var(--wu)) var(--drink-glow, #ffffff),
+    0 0 calc(15 * var(--wu)) color-mix(in srgb, var(--drink-glow, #ffffff) 65%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.72);
+}
+
+/* ==========================================================================
+   Whisper-Minimal Floating HUD Pill (Below Drip Tray)
+   ========================================================================== */
+
+.hud-pill {
+  position: absolute;
+  left: 50%;
+  top: calc(100% - 28px);
+  transform: translate(-50%, -50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  max-width: calc(100vw - 16px);
+  padding: 4px 5px 4px 11px;
+  border-radius: 999px;
+  background: var(--surface-hud);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--border-subtle);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 8px 24px rgba(0, 0, 0, 0.44);
+  pointer-events: auto;
+  touch-action: manipulation;
+  white-space: nowrap;
+}
+
+.mix-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   min-width: 0;
 }
 
-.drink-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 10px;
-  border-radius: 6px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  background: rgba(30, 38, 54, 0.92);
-  color: #f8fafc;
-  font-size: 13px;
-  font-weight: 600;
-  line-height: 1.2;
-  cursor: pointer;
-  touch-action: none;
-  user-select: none;
-  -webkit-user-select: none;
-  white-space: nowrap;
-  transition: transform 0.08s ease, background-color 0.12s ease,
-    border-color 0.12s ease, box-shadow 0.12s ease;
-}
-
-.drink-btn:hover {
-  background: rgba(42, 52, 74, 0.96);
-  border-color: rgba(255, 255, 255, 0.3);
-}
-
-.drink-btn[data-active='true'],
-.drink-btn.active {
-  border-color: #ffffff;
-  background: rgba(56, 72, 100, 0.98);
-  transform: translateY(1px);
-  box-shadow: 0 0 10px rgba(255, 255, 255, 0.28);
-}
-
-.drink-swatch {
-  width: 12px;
-  height: 12px;
+#mix-swatch {
+  width: 13px;
+  height: 13px;
   border-radius: 50%;
-  flex: 0 0 12px;
-  border: 1px solid rgba(255, 255, 255, 0.45);
-  pointer-events: none;
+  flex-shrink: 0;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.45);
+  transition:
+    background-color 120ms linear,
+    box-shadow 150ms ease,
+    border-color 150ms ease;
 }
 
-.drink-label {
-  pointer-events: none;
+#mix-swatch.has-liquid {
+  background:
+    radial-gradient(circle at 32% 28%, rgba(255, 255, 255, 0.48) 0%, transparent 45%),
+    var(--swatch-color, transparent);
+  border-color: rgba(255, 255, 255, 0.42);
+  box-shadow:
+    0 0 10px color-mix(in srgb, var(--swatch-color, transparent) 72%, transparent),
+    inset 0 -1px 2px rgba(0, 0, 0, 0.28);
 }
 
-.fountain-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: 0 0 auto;
+#mix-label {
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: color 140ms ease;
 }
 
-#status-bar {
+#mix-label.has-liquid {
+  color: var(--text-primary);
+}
+
+.hud-divider {
+  width: 1px;
+  height: 14px;
+  flex-shrink: 0;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.hud-actions {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 4px 8px;
-  border-radius: 6px;
-  background: rgba(15, 20, 30, 0.88);
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  gap: 5px;
+  flex-shrink: 0;
 }
 
-#mixed-color-swatch {
-  display: inline-block;
-  width: 16px;
-  height: 16px;
-  min-width: 16px;
-  min-height: 16px;
-  border-radius: 4px;
-  border: 1px solid rgba(255, 255, 255, 0.35);
-  background-color: rgb(0, 0, 0);
-}
-
-#fill-readout {
-  font-size: 12px;
+.hud-btn {
+  appearance: none;
+  -webkit-appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  background: rgba(255, 255, 255, 0.055);
+  color: #cbd5e1;
+  font-family: var(--font-sans);
+  font-size: 11.5px;
   font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  color: #e2e8f0;
-  min-width: 30px;
-  text-align: right;
-}
-
-#reset-btn {
-  padding: 6px 10px;
-  border-radius: 6px;
-  border: 1px solid rgba(255, 255, 255, 0.22);
-  background: rgba(51, 65, 85, 0.92);
-  color: #f8fafc;
-  font-size: 12px;
-  font-weight: 600;
-  line-height: 1.2;
+  letter-spacing: -0.01em;
+  line-height: 1;
   cursor: pointer;
-  touch-action: none;
-  user-select: none;
-  -webkit-user-select: none;
-  white-space: nowrap;
-  transition: background-color 0.12s ease, border-color 0.12s ease;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  transition:
+    background-color 110ms ease,
+    color 110ms ease,
+    border-color 110ms ease,
+    transform 65ms ease;
 }
 
-#reset-btn:hover {
-  background: rgba(71, 85, 105, 0.96);
-  border-color: rgba(255, 255, 255, 0.38);
+@media (hover: hover) and (pointer: fine) {
+  .hud-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+    color: #ffffff;
+    border-color: rgba(255, 255, 255, 0.18);
+  }
 }
 
-#reset-btn:active {
+.hud-btn:active {
   transform: translateY(1px);
 }
 
-#fountain-canvas {
-  flex: 1 1 auto;
-  width: 100%;
-  height: 100%;
-  min-height: 0;
-  display: block;
-  touch-action: none;
-  user-select: none;
-  -webkit-user-select: none;
-  cursor: grab;
+.hud-btn:focus-visible {
+  outline: 2px solid rgba(241, 245, 249, 0.65);
+  outline-offset: 1px;
 }
 
-#fountain-canvas:active {
-  cursor: grabbing;
+#empty-btn.has-liquid {
+  background: rgba(255, 255, 255, 0.1);
+  color: #f8fafc;
+  border-color: rgba(255, 255, 255, 0.16);
 }
 
-@media (max-width: 640px) {
-  #fountain-controls {
-    padding: 5px 8px;
-    gap: 4px 6px;
+#stop-btn {
+  background: rgba(245, 158, 11, 0.16);
+  border-color: rgba(251, 191, 36, 0.34);
+  color: #fde68a;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  #stop-btn:hover {
+    background: rgba(245, 158, 11, 0.26);
+    border-color: rgba(251, 191, 36, 0.5);
+    color: #fef3c7;
+  }
+}
+
+.stop-btn-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 1.5px;
+  background: currentColor;
+  flex-shrink: 0;
+}
+
+@media (max-width: 540px) {
+  .hud-pill {
+    gap: 7px;
+    padding: 3px 4px 3px 9px;
   }
 
-  .drink-buttons-group {
-    gap: 4px;
+  #mix-swatch {
+    width: 11px;
+    height: 11px;
   }
 
-  .drink-btn {
-    padding: 4px 7px;
-    font-size: 11px;
-    gap: 4px;
+  #mix-label {
+    font-size: 11.5px;
+    max-width: 48vw;
   }
 
-  .drink-swatch {
-    width: 10px;
-    height: 10px;
-    flex: 0 0 10px;
-  }
-
-  .fountain-actions {
-    gap: 6px;
-  }
-
-  #status-bar {
-    padding: 3px 6px;
-    gap: 4px;
-  }
-
-  #mixed-color-swatch {
-    width: 14px;
-    height: 14px;
-    min-width: 14px;
-    min-height: 14px;
-  }
-
-  #fill-readout {
-    font-size: 11px;
-    min-width: 26px;
-  }
-
-  #reset-btn {
-    padding: 4px 8px;
+  .hud-btn {
+    height: 24px;
+    padding: 0 8.5px;
     font-size: 11px;
   }
 }
