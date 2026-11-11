@@ -28,22 +28,28 @@ import {
 } from '../types';
 import { SpatialHash } from './spatialHash';
 
-const SUBSTEPS = 6;
+const SUBSTEPS = 4;
 const DEFAULT_DT = 1 / 60;
 const MAX_DT = 1 / 30;
 
-// Double-Density Relaxation (Clavet et al. 2005) + XSPH parameters
-const GRAVITY = -920;
-const REST_DENSITY = 3.4;
-const K_STIFFNESS = 160;
-const K_NEAR = 420;
+// Double-Density Relaxation (Clavet et al. 2005) + XSPH & pool damping parameters
+const GRAVITY = -2150;
+const TERMINAL_FALL_SOFT_VY = -665;
+const TERMINAL_FALL_CAP_SPAN = 15; // Asymptotes smoothly to -680 wu/s (vy >= -680)
+const REST_DENSITY = 3.14;
+const K_STIFFNESS = 215;
+const K_NEAR = 520;
 const MIN_PRESSURE = -6;
-const XSPH_FACTOR = 0.035;
-const MAX_PARTICLE_SPEED = 1650;
+const XSPH_FACTOR = 0.14;
+const POOL_DAMP_RATE = 1.6;
+const MAX_CONSTRAINT_DV = 260;
+const MAX_PARTICLE_SPEED = 1250;
 
-// Glass spring & thick capsule collision constants
-const GLASS_SPRING_OMEGA = 36;
-const MAX_GLASS_SPEED = 1400;
+// Glass spring, cup-frame co-advection & thick capsule collision constants
+const GLASS_SPRING_OMEGA = 28;
+const MAX_GLASS_SPEED = 1050;
+const CO_ADVECT_X = 0.78;
+const CO_ADVECT_Y = 0.85;
 const GLASS_TOUCH_PADDING = 20;
 const HALF_WALL = GLASS_WALL_THICKNESS * 0.5; // 5.25
 const HALF_BASE = GLASS_BASE_THICKNESS * 0.5; // 8.0
@@ -51,14 +57,15 @@ const HALF_BASE = GLASS_BASE_THICKNESS * 0.5; // 8.0
 const EFFECTIVE_SURFACE_PAD = 2.95;
 const WALL_CAPSULE_RADIUS = HALF_WALL + EFFECTIVE_SURFACE_PAD; // 8.2
 const FLOOR_CAPSULE_RADIUS = HALF_BASE + EFFECTIVE_SURFACE_PAD; // 10.95
-const WALL_RESTITUTION = 0.12;
-const WALL_FRICTION = 0.08;
+const WALL_RESTITUTION = 0.04;
+const WALL_FRICTION = 0.16;
+const WALL_CLIMB_KNEE = 130;
 
 // Multi-nozzle emission constants
-const EMIT_RATE_PER_NOZZLE = 210; // particles / sec (~5.3s to fill 1120-particle glass)
-const LANE_OFFSETS = [-3.8, 0, 3.8] as const;
+const EMIT_RATE_PER_NOZZLE = 235; // particles / sec (~2.9s to fill 680-particle glass)
+const LANE_OFFSETS = [-1.4, 0, 1.4] as const;
 const NOZZLE_SPAWN_Y = NOZZLE_TIP_Y - 2;
-const INITIAL_JET_VY = -185;
+const INITIAL_JET_VY = -350;
 
 // Tray & world cleanup constants
 const TRAY_COLLISION_Y = TRAY_SURFACE_Y + 1.8;
@@ -66,8 +73,10 @@ const TRAY_DRAIN_THRESHOLD_Y = TRAY_SURFACE_Y + 3;
 const COUNTER_COLLISION_Y = COUNTER_TOP_Y + 1.8;
 const COUNTER_DRAIN_THRESHOLD_Y = COUNTER_TOP_Y + 3;
 
-// Pair cache capacity for zero-allocation multi-pass substep solver
-const MAX_PAIRS = 98304;
+// Pair cache & Verlet skin capacity for zero-allocation solver
+const VERLET_RADIUS = KERNEL_RADIUS + 2.2; // 17.0 wu tight Verlet skin
+const MAX_PAIRS = 65536;
+const MAX_VERLET_PAIRS = 81920;
 const NUM_DRINKS = DRINKS.length; // 5
 const SURFACE_BINS = 8;
 
@@ -104,17 +113,25 @@ export class FluidSimulation {
   private readonly w3 = new Float32Array(MAX_PARTICLES);
   private readonly w4 = new Float32Array(MAX_PARTICLES);
 
-  // Double-density buffers & pair cache
+  // Double-density buffers & packed pair cache ((i << 16) | j)
   private readonly rho = new Float32Array(MAX_PARTICLES);
   private readonly rhoNear = new Float32Array(MAX_PARTICLES);
   private readonly pressure = new Float32Array(MAX_PARTICLES);
   private readonly nearPressure = new Float32Array(MAX_PARTICLES);
 
-  private readonly pairI = new Int32Array(MAX_PAIRS);
-  private readonly pairJ = new Int32Array(MAX_PAIRS);
+  private readonly pairIJ = new Uint32Array(MAX_PAIRS);
   private readonly pairUx = new Float32Array(MAX_PAIRS);
   private readonly pairUy = new Float32Array(MAX_PAIRS);
   private readonly pairQ = new Float32Array(MAX_PAIRS);
+  private readonly verletIJ = new Uint32Array(MAX_VERLET_PAIRS);
+  private readonly neighborCells = new Int32Array(4);
+  private readonly permScratchF32 = new Float32Array(MAX_PARTICLES);
+  private readonly permScratchU8 = new Uint8Array(MAX_PARTICLES);
+  private readonly inCup = new Uint8Array(MAX_PARTICLES);
+  private lastPairCount = 0;
+  private verletCount = 0;
+  private reclaimCursor = 0;
+  private stepCount = 0;
 
   // Pooled interior tracking & surface height profile for carbonation bubbles
   private readonly insideIndices = new Int32Array(MAX_PARTICLES);
@@ -177,7 +194,7 @@ export class FluidSimulation {
 
   constructor() {
     this.spatialHash = new SpatialHash(
-      KERNEL_RADIUS,
+      VERLET_RADIUS,
       MAX_PARTICLES,
       -64,
       -64,
@@ -259,9 +276,7 @@ export class FluidSimulation {
     this.glass.targetY = TRAY_SURFACE_Y;
   }
 
-  private isInsideGlassCup(x: number, y: number): boolean {
-    const gx = this.glass.x;
-    const gy = this.glass.y;
+  private isInsideGlassCupAt(x: number, y: number, gx: number, gy: number): boolean {
     const floorMidY = gy + HALF_BASE;
     const rimTopY = gy + GLASS_BASE_THICKNESS + GLASS_INNER_HEIGHT + PARTICLE_RADIUS * 1.25;
     if (y < floorMidY || y > rimTopY) return false;
@@ -270,6 +285,10 @@ export class FluidSimulation {
     const innerHalfW =
       GLASS_BOTTOM_HALF_W + t * (GLASS_TOP_HALF_W - GLASS_BOTTOM_HALF_W);
     return Math.abs(x - gx) <= innerHalfW + HALF_WALL * 0.5;
+  }
+
+  private isInsideGlassCup(x: number, y: number): boolean {
+    return this.isInsideGlassCupAt(x, y, this.glass.x, this.glass.y);
   }
 
   /**
@@ -318,13 +337,43 @@ export class FluidSimulation {
     const subDt = dt / SUBSTEPS;
     const prevGlassX = this.glass.x;
     const prevGlassY = this.glass.y;
+    let peakGlassAgitation = 0;
 
+    this.lastPairCount = 0;
     for (let sub = 0; sub < SUBSTEPS; sub++) {
+      const gx0 = this.glass.x;
+      const gy0 = this.glass.y;
+      const gvx0 = this.glass.vx;
+      const gvy0 = this.glass.vy;
+
       this.stepGlassSpring(subDt);
-      this.emitNozzleStreams(subDt);
-      this.stepFluidSubstep(subDt);
+
+      const dgx = this.glass.x - gx0;
+      const dgy = this.glass.y - gy0;
+      const dgvx = this.glass.vx - gvx0;
+      const dgvy = this.glass.vy - gvy0;
+      const ag = Math.abs(this.glass.vx) + Math.abs(this.glass.vy) * 0.5;
+      if (ag > peakGlassAgitation) peakGlassAgitation = ag;
+
+      const rebuildNeighbors = sub === 0 || (sub === 2 && peakGlassAgitation > 480);
+      const applyXsph = (sub & 1) === 1;
+      if (sub === 0) {
+        this.emitNozzleStreams(dt);
+      }
+      this.stepFluidSubstep(
+        subDt,
+        rebuildNeighbors,
+        applyXsph,
+        gx0,
+        gy0,
+        dgx,
+        dgy,
+        dgvx,
+        dgvy
+      );
     }
 
+    this.mixDyeAndFizz(dt, peakGlassAgitation);
     this.compactParticles();
     this.time += dt;
 
@@ -387,43 +436,58 @@ export class FluidSimulation {
     g.y = nextY;
     g.vx = nextVx;
     g.vy = nextVy;
-    g.tilt = clamp(-g.vx * 0.00009, -0.09, 0.09);
+    g.tilt = 0;
   }
 
   private reclaimTrayParticleIfFull(): boolean {
     if (this.particleCount < MAX_PARTICLES) return true;
-    // Reclaim the lowest-life particle resting/splashing near the drip tray outside the glass
-    let victim = -1;
-    let lowestLife = 2;
     const n = this.particleCount;
+    const { life, px, py } = this;
+
+    // Fast O(1) amortized cursor scan for any draining tray/countertop particle (life < 1)
+    let cur = this.reclaimCursor;
+    if (cur >= n) cur = 0;
+    for (let step = 0; step < n; step++) {
+      if (life[cur] < 0.99) {
+        const last = n - 1;
+        if (cur !== last) {
+          this.copyParticle(cur, last);
+        }
+        this.particleCount = last;
+        this.reclaimCursor = cur + 1 < last ? cur + 1 : 0;
+        return true;
+      }
+      cur++;
+      if (cur >= n) cur = 0;
+    }
+
+    // Fallback: reclaim any non-cup particle splashing near the tray
     for (let i = 0; i < n; i++) {
-      if (
-        this.py[i] < TRAY_SURFACE_Y + 28 &&
-        !this.isInsideGlassCup(this.px[i], this.py[i]) &&
-        this.life[i] < lowestLife
-      ) {
-        lowestLife = this.life[i];
-        victim = i;
+      if (py[i] < TRAY_SURFACE_Y + 28 && !this.isInsideGlassCup(px[i], py[i])) {
+        const last = n - 1;
+        if (i !== last) {
+          this.copyParticle(i, last);
+        }
+        this.particleCount = last;
+        return true;
       }
     }
-    if (victim === -1) return false;
-    const last = this.particleCount - 1;
-    if (victim !== last) {
-      this.copyParticle(victim, last);
-    }
-    this.particleCount = last;
-    return true;
+    return false;
   }
 
-  private emitNozzleStreams(subDt: number): void {
+  private emitNozzleStreams(dt: number): void {
     if (this.activeDrinks.size === 0) return;
 
     for (let d = 0; d < NUM_DRINKS; d++) {
       const spec = DRINKS[d];
       if (!this.activeDrinks.has(spec.id)) continue;
 
-      this.emitAccum[d] += EMIT_RATE_PER_NOZZLE * subDt;
-      while (this.emitAccum[d] >= 1) {
+      this.emitAccum[d] += EMIT_RATE_PER_NOZZLE * dt;
+      const burstCount = this.emitAccum[d] | 0;
+      if (burstCount <= 0) continue;
+
+      const jetSpanY = INITIAL_JET_VY * dt;
+      for (let k = 0; k < burstCount; k++) {
         this.emitAccum[d] -= 1;
         if (!this.reclaimTrayParticleIfFull()) {
           this.emitAccum[d] = 0;
@@ -441,11 +505,11 @@ export class FluidSimulation {
           spec.nozzleX - 4.5,
           spec.nozzleX + 4.5
         );
-        const spawnY = NOZZLE_SPAWN_Y + jitterY;
+        const spawnY = NOZZLE_SPAWN_Y + (jetSpanY * k) / burstCount + jitterY;
 
-        // Tapered nozzle convergence + subtle organic turbulence so stream narrows as it falls
-        const turbVx = -laneOffset * 1.7 + (this.rand() - 0.5) * 5.5;
-        const turbVy = INITIAL_JET_VY + (this.rand() - 0.5) * 15.0;
+        // Gentle laminar convergence so the fast-falling stream stays sleek and single-column
+        const turbVx = -laneOffset * 0.35 + (this.rand() - 0.5) * 2.2;
+        const turbVy = INITIAL_JET_VY + (this.rand() - 0.5) * 10.0;
 
         const idx = this.particleCount++;
         this.px[idx] = spawnX;
@@ -454,6 +518,8 @@ export class FluidSimulation {
         this.prevY[idx] = spawnY;
         this.vx[idx] = turbVx;
         this.vy[idx] = turbVy;
+        this.rho[idx] = 0.85;
+        this.inCup[idx] = 0;
 
         this.absR[idx] = spec.absorption[0];
         this.absG[idx] = spec.absorption[1];
@@ -471,9 +537,23 @@ export class FluidSimulation {
     }
   }
 
-  private stepFluidSubstep(subDt: number): void {
+  private stepFluidSubstep(
+    subDt: number,
+    rebuildNeighbors: boolean,
+    applyXsph: boolean,
+    gx0: number,
+    gy0: number,
+    dgx: number,
+    dgy: number,
+    _dgvx: number,
+    _dgvy: number
+  ): void {
     const n = this.particleCount;
-    if (n === 0) return;
+    if (n === 0) {
+      this.lastPairCount = 0;
+      this.verletCount = 0;
+      return;
+    }
 
     const {
       px,
@@ -488,65 +568,124 @@ export class FluidSimulation {
       rhoNear,
       pressure,
       nearPressure,
-      pairI,
-      pairJ,
+      pairIJ,
       pairUx,
       pairUy,
       pairQ,
-      absR,
-      absG,
-      absB,
-      fizz,
-      baseFizz,
-      w0,
-      w1,
-      w2,
-      w3,
-      w4,
+      verletIJ,
+      neighborCells,
+      inCup,
+      life,
       spatialHash,
     } = this;
 
-    // 1. Apply gravity and advance predicted positions
+    const shiftCupX = CO_ADVECT_X * dgx;
+    const shiftCupY = CO_ADVECT_Y * dgy;
+    const floorMidY = gy0 + HALF_BASE;
+    const baseTopY = gy0 + GLASS_BASE_THICKNESS;
+    const cupFloorBandY = baseTopY + 24;
+    const rimTopY = baseTopY + GLASS_INNER_HEIGHT + PARTICLE_RADIUS * 1.25;
+    const invInnerH = 1 / GLASS_INNER_HEIGHT;
+    const halfWSlope = GLASS_TOP_HALF_W - GLASS_BOTTOM_HALF_W;
+    const maxCupHalfW = GLASS_TOP_HALF_W + HALF_WALL * 0.5;
+
+    // 1. Cup-frame co-advection, gravity with terminal soft-cap, and ballistic prediction
     for (let i = 0; i < n; i++) {
-      vy[i] += GRAVITY * subDt;
-      prevX[i] = px[i];
-      prevY[i] = py[i];
-      px[i] += vx[i] * subDt;
-      py[i] += vy[i] * subDt;
+      const x0 = px[i];
+      const y0 = py[i];
+      const vy0 = vy[i];
+
+      let insideCup = false;
+      const absDxCup = Math.abs(x0 - gx0);
+      if (absDxCup <= maxCupHalfW && y0 >= floorMidY && y0 <= rimTopY) {
+        if (!(vy0 < -260 && y0 > cupFloorBandY && rho[i] < 2.15)) {
+          let t = (y0 - baseTopY) * invInnerH;
+          if (t < 0) t = 0;
+          else if (t > 1) t = 1;
+          insideCup = absDxCup <= GLASS_BOTTOM_HALF_W + t * halfWSlope + HALF_WALL * 0.5;
+        }
+      }
+
+      let bx = x0;
+      let by = y0;
+      if (insideCup) {
+        inCup[i] = 1;
+        bx += shiftCupX;
+        by += shiftCupY;
+      } else {
+        inCup[i] = 0;
+      }
+
+      prevX[i] = bx;
+      prevY[i] = by;
+
+      let nextVy = vy0 + GRAVITY * subDt;
+      if (nextVy < TERMINAL_FALL_SOFT_VY) {
+        const excess = TERMINAL_FALL_SOFT_VY - nextVy;
+        nextVy =
+          TERMINAL_FALL_SOFT_VY -
+          (TERMINAL_FALL_CAP_SPAN * excess) / (TERMINAL_FALL_CAP_SPAN + excess);
+      }
+      vy[i] = nextVy;
+
+      px[i] = bx + vx[i] * subDt;
+      py[i] = by + nextVy * subDt;
       rho[i] = 0.85;
       rhoNear[i] = 0.0;
-      dvx[i] = 0.0;
-      dvy[i] = 0.0;
+      if (applyXsph) {
+        dvx[i] = 0.0;
+        dvy[i] = 0.0;
+      }
     }
 
-    // 2. Build spatial grid & extract active neighbor pairs (r < h, j > i)
-    spatialHash.build(px, py, n);
-    const { head, next, cellX, cellY, cols, rows } = spatialHash;
+    // 2. Extract active neighbor pairs via CSR cell slices (sub===0) or packed Verlet list
     const h = KERNEL_RADIUS;
     const h2 = h * h;
     const invH = 1 / h;
-
     let pairCount = 0;
-    for (let i = 0; i < n; i++) {
-      const xi = px[i];
-      const yi = py[i];
-      const cx = cellX[i];
-      const cy = cellY[i];
 
-      const minCy = cy > 0 ? cy - 1 : 0;
-      const maxCy = cy + 1 < rows ? cy + 1 : rows - 1;
-      const minCx = cx > 0 ? cx - 1 : 0;
-      const maxCx = cx + 1 < cols ? cx + 1 : cols - 1;
+    if (rebuildNeighbors) {
+      spatialHash.build(px, py, n);
+      if (subDt > 0 && ((this.stepCount++ & 15) === 0) && n > 64) {
+        this.reorderParticlesByCell(n);
+      }
+      const {
+        dirtyCells,
+        dirtyCount,
+        cellCount,
+        cellStart,
+        sortedIdx,
+        sortedX,
+        sortedY,
+        cols,
+        rows,
+      } = spatialHash;
+      const vSkin2 = VERLET_RADIUS * VERLET_RADIUS;
+      let vCount = 0;
 
-      for (let ny = minCy; ny <= maxCy; ny++) {
-        const rowOffset = ny * cols;
-        for (let nx = minCx; nx <= maxCx; nx++) {
-          let j = head[rowOffset + nx];
-          while (j !== -1) {
-            if (j > i) {
-              const dx = px[j] - xi;
-              const dy = py[j] - yi;
-              const r2 = dx * dx + dy * dy;
+      for (let d = 0; d < dirtyCount; d++) {
+        const c = dirtyCells[d];
+        const countA = cellCount[c];
+        const startA = cellStart[c];
+        const endA = startA + countA;
+
+        // 2a. Intra-cell pairs (b > a) on contiguous L1-resident sortedX/sortedY
+        for (let a = startA; a < endA - 1; a++) {
+          const xi = sortedX[a];
+          const yi = sortedY[a];
+          const i = sortedIdx[a];
+          const iShift = i << 16;
+
+          for (let b = a + 1; b < endA; b++) {
+            const dx = sortedX[b] - xi;
+            const dy = sortedY[b] - yi;
+            const r2 = dx * dx + dy * dy;
+            if (r2 < vSkin2) {
+              const j = sortedIdx[b];
+              const packed = iShift | j;
+              if (vCount < MAX_VERLET_PAIRS) {
+                verletIJ[vCount++] = packed;
+              }
               if (r2 < h2) {
                 let ux: number;
                 let uy: number;
@@ -558,7 +697,9 @@ export class FluidSimulation {
                   uy = dy * invR;
                   q = 1 - r * invH;
                 } else {
-                  const angle = ((i * 73856093) ^ (j * 19349663)) & 0xff;
+                  const lo = i < j ? i : j;
+                  const hi = i < j ? j : i;
+                  const angle = ((lo * 73856093) ^ (hi * 19349663)) & 0xff;
                   const rad = angle * 0.02454369;
                   ux = Math.cos(rad);
                   uy = Math.sin(rad);
@@ -573,8 +714,7 @@ export class FluidSimulation {
                 rhoNear[j] += q3;
 
                 if (pairCount < MAX_PAIRS) {
-                  pairI[pairCount] = i;
-                  pairJ[pairCount] = j;
+                  pairIJ[pairCount] = packed;
                   pairUx[pairCount] = ux;
                   pairUy[pairCount] = uy;
                   pairQ[pairCount] = q;
@@ -582,34 +722,174 @@ export class FluidSimulation {
                 }
               }
             }
-            j = next[j];
+          }
+        }
+
+        // 2b. 4 forward neighbor cells with O(1) empty-cell skip
+        const cy = (c / cols) | 0;
+        const cx = c - cy * cols;
+        let nbLen = 0;
+        if (cx + 1 < cols && cellCount[c + 1] > 0) {
+          neighborCells[nbLen++] = c + 1;
+        }
+        if (cy + 1 < rows) {
+          const nextRowCell = c + cols;
+          if (cx > 0 && cellCount[nextRowCell - 1] > 0) {
+            neighborCells[nbLen++] = nextRowCell - 1;
+          }
+          if (cellCount[nextRowCell] > 0) {
+            neighborCells[nbLen++] = nextRowCell;
+          }
+          if (cx + 1 < cols && cellCount[nextRowCell + 1] > 0) {
+            neighborCells[nbLen++] = nextRowCell + 1;
+          }
+        }
+
+        for (let nbIdx = 0; nbIdx < nbLen; nbIdx++) {
+          const nb = neighborCells[nbIdx];
+          const startB = cellStart[nb];
+          const endB = startB + cellCount[nb];
+
+          for (let a = startA; a < endA; a++) {
+            const xi = sortedX[a];
+            const yi = sortedY[a];
+            const i = sortedIdx[a];
+            const iShift = i << 16;
+
+            for (let b = startB; b < endB; b++) {
+              const dx = sortedX[b] - xi;
+              const dy = sortedY[b] - yi;
+              const r2 = dx * dx + dy * dy;
+              if (r2 < vSkin2) {
+                const j = sortedIdx[b];
+                const packed = iShift | j;
+                if (vCount < MAX_VERLET_PAIRS) {
+                  verletIJ[vCount++] = packed;
+                }
+                if (r2 < h2) {
+                  let ux: number;
+                  let uy: number;
+                  let q: number;
+                  if (r2 > 1e-8) {
+                    const r = Math.sqrt(r2);
+                    const invR = 1 / r;
+                    ux = dx * invR;
+                    uy = dy * invR;
+                    q = 1 - r * invH;
+                  } else {
+                    const lo = i < j ? i : j;
+                    const hi = i < j ? j : i;
+                    const angle = ((lo * 73856093) ^ (hi * 19349663)) & 0xff;
+                    const rad = angle * 0.02454369;
+                    ux = Math.cos(rad);
+                    uy = Math.sin(rad);
+                    q = 0.999;
+                  }
+
+                  const q2 = q * q;
+                  const q3 = q2 * q;
+                  rho[i] += q2;
+                  rho[j] += q2;
+                  rhoNear[i] += q3;
+                  rhoNear[j] += q3;
+
+                  if (pairCount < MAX_PAIRS) {
+                    pairIJ[pairCount] = packed;
+                    pairUx[pairCount] = ux;
+                    pairUy[pairCount] = uy;
+                    pairQ[pairCount] = q;
+                    pairCount++;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      this.verletCount = vCount;
+    } else {
+      const vCount = this.verletCount;
+      for (let vp = 0; vp < vCount; vp++) {
+        const packed = verletIJ[vp];
+        const i = packed >>> 16;
+        const j = packed & 0xffff;
+        const dx = px[j] - px[i];
+        const dy = py[j] - py[i];
+        const r2 = dx * dx + dy * dy;
+        if (r2 < h2) {
+          let ux: number;
+          let uy: number;
+          let q: number;
+          if (r2 > 1e-8) {
+            const r = Math.sqrt(r2);
+            const invR = 1 / r;
+            ux = dx * invR;
+            uy = dy * invR;
+            q = 1 - r * invH;
+          } else {
+            const lo = i < j ? i : j;
+            const hi = i < j ? j : i;
+            const angle = ((lo * 73856093) ^ (hi * 19349663)) & 0xff;
+            const rad = angle * 0.02454369;
+            ux = Math.cos(rad);
+            uy = Math.sin(rad);
+            q = 0.999;
+          }
+
+          const q2 = q * q;
+          const q3 = q2 * q;
+          rho[i] += q2;
+          rho[j] += q2;
+          rhoNear[i] += q3;
+          rhoNear[j] += q3;
+
+          if (pairCount < MAX_PAIRS) {
+            pairIJ[pairCount] = packed;
+            pairUx[pairCount] = ux;
+            pairUy[pairCount] = uy;
+            pairQ[pairCount] = q;
+            pairCount++;
           }
         }
       }
     }
+    this.lastPairCount = pairCount;
 
     // 3. Double-Density Relaxation (Clavet et al. 2005)
     for (let i = 0; i < n; i++) {
-      // Smooth vena-contracta depressurization below nozzle orifice
-      const jetExit = clamp((NOZZLE_TIP_Y - py[i]) / 52, 0, 1);
+      // Smooth vena-contracta depressurization below nozzle orifice + cohesive laminar free-fall
+      const yi = py[i];
+      const jetExit = clamp((NOZZLE_TIP_Y - yi) / 52, 0, 1);
       const jetRamp = jetExit * jetExit;
+      const freeFallSoft = this.inCup[i] === 0 && vy[i] < -210 ? 0.12 : 1;
       const rawP = K_STIFFNESS * (rho[i] - REST_DENSITY);
+      const drainScale = yi <= TRAY_COLLISION_Y && life[i] < 0.7 ? 0.25 : 1;
       pressure[i] =
-        rawP > 0 ? rawP * jetRamp : rawP < MIN_PRESSURE ? MIN_PRESSURE : rawP;
+        (rawP > 0 ? rawP * freeFallSoft : rawP < MIN_PRESSURE ? MIN_PRESSURE : rawP) *
+        jetRamp *
+        drainScale;
 
       // Near-pressure engages strongly inside bulk pools to prevent compression/stacking
-      // while allowing stretched falling streams to stay cohesive without spraying apart
-      const u = clamp((rho[i] - 2.75) / 0.65, 0, 1);
+      // while allowing stretched falling streams & plunging plumes to slip into the pool
+      const u = clamp((rho[i] - 2.15) / 0.65, 0, 1);
       const bulk = u * u * (3 - 2 * u);
-      nearPressure[i] = K_NEAR * jetRamp * (0.008 + 0.992 * bulk) * rhoNear[i];
+      const plungeSoft = vy[i] < -140 ? clamp((vy[i] + 420) * (1 / 280), 0.14, 1) : 1;
+      nearPressure[i] =
+        K_NEAR *
+        jetRamp *
+        drainScale *
+        freeFallSoft *
+        (0.01 + 0.99 * bulk * plungeSoft) *
+        rhoNear[i];
     }
 
-    const dispScale = 14.5 * subDt * subDt;
-    const maxPairDisp = h * 0.28;
+    const dispScale = 27.5 * subDt * subDt;
+    const maxPairDisp = h * 0.22;
 
     for (let p = 0; p < pairCount; p++) {
-      const i = pairI[p];
-      const j = pairJ[p];
+      const packed = pairIJ[p];
+      const i = packed >>> 16;
+      const j = packed & 0xffff;
       const q = pairQ[p];
       let disp =
         dispScale *
@@ -625,40 +905,98 @@ export class FluidSimulation {
       py[j] += dy;
     }
 
-    // 4. Derive relaxed velocities from position change
+    // 4 & 5. Fused DDR spike clamp + pre-velocity boundary resolution + viscous pool velocity derivation
     const invSubDt = 1 / subDt;
-    for (let i = 0; i < n; i++) {
-      vx[i] = (px[i] - prevX[i]) * invSubDt;
-      vy[i] = (py[i] - prevY[i]) * invSubDt;
-    }
+    this.resolveBoundariesAndVelocities(subDt, invSubDt, !applyXsph);
 
-    // 5. Light XSPH velocity smoothing + shear-driven local Beer-Lambert dye & recipe mixing
-    for (let p = 0; p < pairCount; p++) {
-      const i = pairI[p];
-      const j = pairJ[p];
+    // 6. Cohesive XSPH velocity smoothing on odd substeps + unconditional speed safety clamp
+    if (applyXsph) {
+      const nozzleFreeFallTopY = NOZZLE_TIP_Y - 56;
+      const xsphPair = XSPH_FACTOR * 1.65;
+      for (let p = 0; p < pairCount; p++) {
+        const packed = pairIJ[p];
+        const i = packed >>> 16;
+        const j = packed & 0xffff;
+        const isPlunging = vy[i] < -150 || vy[j] < -150;
+        const w =
+          (!isPlunging &&
+          rho[i] + rho[j] > 4.2 &&
+          py[i] < nozzleFreeFallTopY &&
+          py[j] < nozzleFreeFallTopY
+            ? xsphPair
+            : 0.02) * pairQ[p];
+        const ix = (vx[j] - vx[i]) * w;
+        const iy = (vy[j] - vy[i]) * w;
+        dvx[i] += ix;
+        dvy[i] += iy;
+        dvx[j] -= ix;
+        dvy[j] -= iy;
+      }
+
+      const maxSpeed2 = MAX_PARTICLE_SPEED * MAX_PARTICLE_SPEED;
+      for (let i = 0; i < n; i++) {
+        const vxi = vx[i] + dvx[i];
+        const vyi = vy[i] + dvy[i];
+        const sp2 = vxi * vxi + vyi * vyi;
+        if (sp2 > maxSpeed2) {
+          const s = MAX_PARTICLE_SPEED / Math.sqrt(sp2);
+          vx[i] = vxi * s;
+          vy[i] = vyi * s;
+        } else {
+          vx[i] = vxi;
+          vy[i] = vyi;
+        }
+      }
+    }
+  }
+
+  /**
+   * Once-per-step 10-channel Beer-Lambert absorption, 5-drink recipe weight,
+   * and carbonation fizz exchange using the final substep's cached neighbor pairs.
+   */
+  private mixDyeAndFizz(dt: number, peakGlassAgitation: number): void {
+    const n = this.particleCount;
+    if (n === 0) return;
+
+    const {
+      py,
+      vx,
+      vy,
+      pairIJ,
+      pairQ,
+      inCup,
+      absR,
+      absG,
+      absB,
+      fizz,
+      baseFizz,
+      w0,
+      w1,
+      w2,
+      w3,
+      w4,
+      lastPairCount,
+    } = this;
+
+    const glassAgitation = Math.min(peakGlassAgitation * 0.015, 4.5);
+    const baseMixRate = 0.28 + glassAgitation;
+    const traySkipY = TRAY_SURFACE_Y + 8;
+
+    for (let p = 0; p < lastPairCount; p++) {
+      const packed = pairIJ[p];
+      const i = packed >>> 16;
+      const j = packed & 0xffff;
+      if ((inCup[i] | inCup[j]) === 0 && py[i] < traySkipY && py[j] < traySkipY) {
+        continue;
+      }
       const q = pairQ[p];
 
       const rvx = vx[j] - vx[i];
       const rvy = vy[j] - vy[i];
-      const relSpeed = Math.sqrt(rvx * rvx + rvy * rvy);
+      const relSpeed = Math.abs(rvx) + Math.abs(rvy) * 0.9;
 
-      // Light XSPH velocity smoothing (0.035) keeps rest pools calm while preserving vortices
-      const xsphWeight = XSPH_FACTOR * q;
-      const ix = rvx * xsphWeight;
-      const iy = rvy * xsphWeight;
-      dvx[i] += ix;
-      dvy[i] += iy;
-      dvx[j] -= ix;
-      dvy[j] -= iy;
-
-      // Shear + glass-agitation local dye & recipe mixing:
-      // Stationary pours preserve dramatic swirling plumes; moving/shaking the glass blends rapidly
-      const glassAgitation = Math.min(
-        (Math.abs(this.glass.vx) + Math.abs(this.glass.vy) * 0.5) * 0.014,
-        4.2
-      );
-      let alpha = (0.32 + glassAgitation + 0.022 * relSpeed) * q * subDt;
-      if (alpha > 0.22) alpha = 0.22;
+      let alpha = (baseMixRate + 0.055 * relSpeed) * q * dt;
+      if (alpha > 0.36) alpha = 0.36;
       else if (alpha < 0) alpha = 0;
 
       const dR = (absR[j] - absR[i]) * alpha;
@@ -696,208 +1034,320 @@ export class FluidSimulation {
       baseFizz[j] -= dBaseFizz;
     }
 
+    const fizzDecay = 0.12 * dt;
     for (let i = 0; i < n; i++) {
-      vx[i] += dvx[i];
-      vy[i] += dvy[i];
-
-      // Decay carbonation fizz slowly (~0.12/s) toward baseline carbonation shimmer
       if (fizz[i] > baseFizz[i]) {
-        const decayed = fizz[i] - 0.12 * subDt;
+        const decayed = fizz[i] - fizzDecay;
         fizz[i] = decayed > baseFizz[i] ? decayed : baseFizz[i];
       }
     }
-
-    // 6. Collide against 3 thick glass capsules + drip tray grate + clamp max speed
-    this.resolveBoundaries(subDt);
   }
 
-  private collideCapsule(
-    i: number,
-    ax: number,
-    ay: number,
-    bx: number,
-    by: number,
-    radius: number,
-    fallbackNx: number,
-    fallbackNy: number,
-    gvx: number,
-    gvy: number
+  /**
+   * Register-fused post-DDR pass:
+   * 1) Clamps DDR pressure-correction velocity spikes (<= 260 wu/s per substep)
+   * 2) Resolves glass capsule & drip tray / countertop boundaries BEFORE velocity derivation
+   * 3) Derives PBD velocities and applies exp(-1.6 * dt) viscous damping to pooled particles
+   */
+  private resolveBoundariesAndVelocities(
+    subDt: number,
+    invSubDt: number,
+    clampSpeed: boolean
   ): void {
-    const abx = bx - ax;
-    const aby = by - ay;
-    const abLen2 = abx * abx + aby * aby;
-    const px = this.px[i];
-    const py = this.py[i];
-
-    let t = ((px - ax) * abx + (py - ay) * aby) / abLen2;
-    if (t < 0) t = 0;
-    else if (t > 1) t = 1;
-
-    const cx = ax + t * abx;
-    const cy = ay + t * aby;
-    const dx = px - cx;
-    const dy = py - cy;
-    const dist2 = dx * dx + dy * dy;
-
-    if (dist2 >= radius * radius) return;
-
-    let nx: number;
-    let ny: number;
-    let pen: number;
-    if (dist2 > 1e-8) {
-      const dist = Math.sqrt(dist2);
-      const invDist = 1 / dist;
-      nx = dx * invDist;
-      ny = dy * invDist;
-      pen = radius - dist;
-    } else {
-      nx = fallbackNx;
-      ny = fallbackNy;
-      pen = radius;
-    }
-
-    this.px[i] = px + nx * pen;
-    this.py[i] = py + ny * pen;
-
-    const rvx = this.vx[i] - gvx;
-    const rvy = this.vy[i] - gvy;
-    const vn = rvx * nx + rvy * ny;
-    if (vn < 0) {
-      const tx = -ny;
-      const ty = nx;
-      const vt = rvx * tx + rvy * ty;
-      const newVn = -vn * WALL_RESTITUTION;
-      let newVt = vt * (1 - WALL_FRICTION);
-      // Damp thin-film Munroe squirting up steep walls while keeping bulk slosh & whip spills lively
-      const upSpeed = newVt * ty;
-      if (Math.abs(ny) < 0.5 && upSpeed > 180) {
-        newVt *= (180 + (upSpeed - 180) * 0.55) / upSpeed;
-      }
-      this.vx[i] = gvx + nx * newVn + tx * newVt;
-      this.vy[i] = gvy + ny * newVn + ty * newVt;
-    }
-  }
-
-  private resolveBoundaries(subDt: number): void {
     const n = this.particleCount;
+    const { px, py, prevX, prevY, vx, vy, inCup, life } = this;
+
     const gx = this.glass.x;
     const gy = this.glass.y;
     const gvx = this.glass.vx;
     const gvy = this.glass.vy;
+    const coWallVx = (1 - CO_ADVECT_X) * gvx;
+    const coWallVy = (1 - CO_ADVECT_Y) * gvy;
 
-    // 3 thick line-segment capsules in world space:
-    // 1) Left tapered wall
+    // Precomputed glass capsule segment geometry
     const lax = gx - GLASS_BOTTOM_HALF_W - HALF_WALL;
     const lay = gy + HALF_WALL;
     const lbx = gx - GLASS_TOP_HALF_W - HALF_WALL;
     const lby = gy + GLASS_BASE_THICKNESS + GLASS_INNER_HEIGHT;
+    const labx = lbx - lax;
+    const wallAby = lby - lay;
+    const wallInvLen2 = 1 / (labx * labx + wallAby * wallAby);
 
-    // 2) Right tapered wall (symmetric)
     const rax = gx + GLASS_BOTTOM_HALF_W + HALF_WALL;
-    const ray = gy + HALF_WALL;
     const rbx = gx + GLASS_TOP_HALF_W + HALF_WALL;
-    const rby = lby;
+    const rabx = rbx - rax;
 
-    // 3) Thick bottom floor segment at gy + baseThick * 0.5
     const fax = gx - GLASS_BOTTOM_HALF_W - HALF_WALL * 0.5;
     const fay = gy + HALF_BASE;
     const fbx = gx + GLASS_BOTTOM_HALF_W + HALF_WALL * 0.5;
-    const fby = fay;
+
+    const floorR = FLOOR_CAPSULE_RADIUS;
+    const floorR2 = floorR * floorR;
+    const wallR = WALL_CAPSULE_RADIUS;
+    const wallR2 = wallR * wallR;
+    const wallKeepTang = 1 - WALL_FRICTION;
 
     const glassBoundHalfW = GLASS_TOP_HALF_W + GLASS_WALL_THICKNESS + WALL_CAPSULE_RADIUS + 8;
     const glassBoundMinY = gy - FLOOR_CAPSULE_RADIUS - 6;
     const glassBoundMaxY = lby + WALL_CAPSULE_RADIUS + 6;
+
+    const maxCorr = MAX_CONSTRAINT_DV * subDt;
+    const maxCorr2 = maxCorr * maxCorr;
+    const poolDamp = Math.exp(-POOL_DAMP_RATE * subDt);
     const maxSpeed2 = MAX_PARTICLE_SPEED * MAX_PARTICLE_SPEED;
 
     for (let i = 0; i < n; i++) {
-      const x0 = this.px[i];
-      const y0 = this.py[i];
+      let x = px[i];
+      let y = py[i];
+      let pvx = prevX[i];
+      let pvy = prevY[i];
 
-      // Broadphase AABB check against glass capsules
+      // 1. Clamp DDR position-correction velocity spikes
+      const predX = pvx + vx[i] * subDt;
+      const predY = pvy + vy[i] * subDt;
+      const corrX = x - predX;
+      const corrY = y - predY;
+      const corr2 = corrX * corrX + corrY * corrY;
+      if (corr2 > maxCorr2) {
+        const s = maxCorr / Math.sqrt(corr2);
+        x = predX + corrX * s;
+        y = predY + corrY * s;
+      }
+
+      const cupFlag = inCup[i];
+
+      // 2. Pre-velocity 3-capsule glass collision
       if (
-        Math.abs(x0 - gx) < glassBoundHalfW &&
-        y0 > glassBoundMinY &&
-        y0 < glassBoundMaxY
+        Math.abs(x - gx) < glassBoundHalfW &&
+        y > glassBoundMinY &&
+        y < glassBoundMaxY
       ) {
-        this.collideCapsule(
-          i,
-          fax,
-          fay,
-          fbx,
-          fby,
-          FLOOR_CAPSULE_RADIUS,
-          0,
-          1,
-          gvx,
-          gvy
-        );
-        this.collideCapsule(
-          i,
-          lax,
-          lay,
-          lbx,
-          lby,
-          WALL_CAPSULE_RADIUS,
-          1,
-          0,
-          gvx,
-          gvy
-        );
-        this.collideCapsule(
-          i,
-          rax,
-          ray,
-          rbx,
-          rby,
-          WALL_CAPSULE_RADIUS,
-          -1,
-          0,
-          gvx,
-          gvy
-        );
-      }
+        const wVx = cupFlag ? coWallVx : gvx;
+        const wVy = cupFlag ? coWallVy : gvy;
 
-      // Drip tray grate & countertop collision + smooth grate slot draining
-      const xi = this.px[i];
-      const yi = this.py[i];
-      const overTray = xi >= TRAY_LEFT_X && xi <= TRAY_RIGHT_X;
+        // 2a. Horizontal bottom floor capsule
+        const fcx = x < fax ? fax : x > fbx ? fbx : x;
+        const fdx = x - fcx;
+        const fdy = y - fay;
+        const fd2 = fdx * fdx + fdy * fdy;
+        if (fd2 < floorR2) {
+          let nx = 0;
+          let ny = 1;
+          let pen = floorR;
+          if (fd2 > 1e-8) {
+            const dist = Math.sqrt(fd2);
+            const invDist = 1 / dist;
+            nx = fdx * invDist;
+            ny = fdy * invDist;
+            pen = floorR - dist;
+          }
+          const nxPx = x + nx * pen;
+          const nyPy = y + ny * pen;
+          const rvx = (x - pvx) * invSubDt - wVx;
+          const rvy = (y - pvy) * invSubDt - wVy;
+          const vn = rvx * nx + rvy * ny;
+          x = nxPx;
+          y = nyPy;
+          if (vn < 0) {
+            const tx = -ny;
+            const ty = nx;
+            const newVn = -vn * WALL_RESTITUTION;
+            const newVt = (rvx * tx + rvy * ty) * wallKeepTang;
+            pvx = x - (wVx + nx * newVn + tx * newVt) * subDt;
+            pvy = y - (wVy + ny * newVn + ty * newVt) * subDt;
+          } else {
+            pvx += nx * pen;
+            pvy += ny * pen;
+          }
+        }
 
-      if (overTray) {
-        if (yi <= TRAY_DRAIN_THRESHOLD_Y) {
-          // Periodic stainless grate slots drain slightly faster than grate bars
-          const slotFactor = Math.sin(xi * 0.42) > 0.15 ? 3.1 : 1.9;
-          this.life[i] -= slotFactor * subDt;
-          // Let draining droplets sink gently through slots right at the end of life
-          const sinkOffset = this.life[i] < 0.25 ? (0.25 - this.life[i]) * 14 : 0;
-          const grateFloorY = TRAY_COLLISION_Y - sinkOffset;
-          if (yi < grateFloorY) {
-            this.py[i] = grateFloorY;
-            if (this.vy[i] < 0) {
-              this.vy[i] = -this.vy[i] * 0.16;
-              this.vx[i] *= 0.88;
+        // 2b. Left tapered wall capsule
+        let lt = ((x - lax) * labx + (y - lay) * wallAby) * wallInvLen2;
+        if (lt < 0) lt = 0;
+        else if (lt > 1) lt = 1;
+        const ldx = x - (lax + lt * labx);
+        const ldy = y - (lay + lt * wallAby);
+        const ld2 = ldx * ldx + ldy * ldy;
+        if (ld2 < wallR2) {
+          let nx = 1;
+          let ny = 0;
+          let pen = wallR;
+          if (ld2 > 1e-8) {
+            const dist = Math.sqrt(ld2);
+            const invDist = 1 / dist;
+            nx = ldx * invDist;
+            ny = ldy * invDist;
+            pen = wallR - dist;
+          }
+          const nxPx = x + nx * pen;
+          const nyPy = y + ny * pen;
+          const rvx = (x - pvx) * invSubDt - wVx;
+          const rvy = (y - pvy) * invSubDt - wVy;
+          const vn = rvx * nx + rvy * ny;
+          x = nxPx;
+          y = nyPy;
+          if (vn < 0) {
+            const tx = -ny;
+            const ty = nx;
+            const newVn = -vn * WALL_RESTITUTION;
+            let newVt = (rvx * tx + rvy * ty) * wallKeepTang;
+            const upSpeed = newVt * ty;
+            if (Math.abs(ny) < 0.5 && upSpeed > WALL_CLIMB_KNEE) {
+              newVt *= (WALL_CLIMB_KNEE + (upSpeed - WALL_CLIMB_KNEE) * 0.28) / upSpeed;
             }
+            pvx = x - (wVx + nx * newVn + tx * newVt) * subDt;
+            pvy = y - (wVy + ny * newVn + ty * newVt) * subDt;
+          } else {
+            pvx += nx * pen;
+            pvy += ny * pen;
           }
         }
-      } else if (yi <= COUNTER_DRAIN_THRESHOLD_Y) {
-        this.life[i] -= 2.2 * subDt;
-        if (yi < COUNTER_COLLISION_Y) {
-          this.py[i] = COUNTER_COLLISION_Y;
-          if (this.vy[i] < 0) {
-            this.vy[i] = -this.vy[i] * 0.14;
-            this.vx[i] *= 0.86;
+
+        // 2c. Right tapered wall capsule
+        let rt = ((x - rax) * rabx + (y - lay) * wallAby) * wallInvLen2;
+        if (rt < 0) rt = 0;
+        else if (rt > 1) rt = 1;
+        const rdx = x - (rax + rt * rabx);
+        const rdy = y - (lay + rt * wallAby);
+        const rd2 = rdx * rdx + rdy * rdy;
+        if (rd2 < wallR2) {
+          let nx = -1;
+          let ny = 0;
+          let pen = wallR;
+          if (rd2 > 1e-8) {
+            const dist = Math.sqrt(rd2);
+            const invDist = 1 / dist;
+            nx = rdx * invDist;
+            ny = rdy * invDist;
+            pen = wallR - dist;
+          }
+          const nxPx = x + nx * pen;
+          const nyPy = y + ny * pen;
+          const rvx = (x - pvx) * invSubDt - wVx;
+          const rvy = (y - pvy) * invSubDt - wVy;
+          const vn = rvx * nx + rvy * ny;
+          x = nxPx;
+          y = nyPy;
+          if (vn < 0) {
+            const tx = -ny;
+            const ty = nx;
+            const newVn = -vn * WALL_RESTITUTION;
+            let newVt = (rvx * tx + rvy * ty) * wallKeepTang;
+            const upSpeed = newVt * ty;
+            if (Math.abs(ny) < 0.5 && upSpeed > WALL_CLIMB_KNEE) {
+              newVt *= (WALL_CLIMB_KNEE + (upSpeed - WALL_CLIMB_KNEE) * 0.28) / upSpeed;
+            }
+            pvx = x - (wVx + nx * newVn + tx * newVt) * subDt;
+            pvy = y - (wVy + ny * newVn + ty * newVt) * subDt;
+          } else {
+            pvx += nx * pen;
+            pvy += ny * pen;
           }
         }
       }
 
-      // Clamp extreme velocity spikes for unconditional solver safety
-      const vxi = this.vx[i];
-      const vyi = this.vy[i];
-      const sp2 = vxi * vxi + vyi * vyi;
-      if (sp2 > maxSpeed2) {
-        const s = MAX_PARTICLE_SPEED / Math.sqrt(sp2);
-        this.vx[i] = vxi * s;
-        this.vy[i] = vyi * s;
+      // 3. Drip tray grate & countertop collision (fast single-branch reject for y > 77)
+      if (y <= TRAY_DRAIN_THRESHOLD_Y) {
+        if (x >= TRAY_LEFT_X && x <= TRAY_RIGHT_X) {
+          const phase = x * 0.066845;
+          const slotFactor = phase - (phase | 0) < 0.45 ? 3.1 : 1.9;
+          const nextLife = life[i] - slotFactor * subDt;
+          life[i] = nextLife;
+          const sinkOffset = nextLife < 0.25 ? (0.25 - nextLife) * 14 : 0;
+          const grateFloorY = TRAY_COLLISION_Y - sinkOffset;
+          if (y < grateFloorY) {
+            const curVy = (y - pvy) * invSubDt;
+            const curVx = (x - pvx) * invSubDt;
+            if (curVy < 0) {
+              pvy = grateFloorY - -curVy * 0.08 * subDt;
+              pvx = x - curVx * 0.84 * subDt;
+            } else {
+              pvy += grateFloorY - y;
+            }
+            y = grateFloorY;
+          }
+        } else if (y <= COUNTER_DRAIN_THRESHOLD_Y) {
+          life[i] -= 2.2 * subDt;
+          if (y < COUNTER_COLLISION_Y) {
+            const curVy = (y - pvy) * invSubDt;
+            const curVx = (x - pvx) * invSubDt;
+            if (curVy < 0) {
+              pvy = COUNTER_COLLISION_Y - -curVy * 0.07 * subDt;
+              pvx = x - curVx * 0.82 * subDt;
+            } else {
+              pvy += COUNTER_COLLISION_Y - y;
+            }
+            y = COUNTER_COLLISION_Y;
+          }
+        }
       }
+
+      px[i] = x;
+      py[i] = y;
+      prevX[i] = pvx;
+      prevY[i] = pvy;
+
+      // 4. Derive relaxed PBD velocity + viscous pool damping
+      let nvx = (x - pvx) * invSubDt;
+      let nvy = (y - pvy) * invSubDt;
+      if (cupFlag) {
+        nvx = coWallVx + (nvx - coWallVx) * poolDamp;
+        nvy = coWallVy + (nvy - coWallVy) * poolDamp;
+      }
+      if (clampSpeed) {
+        const sp2 = nvx * nvx + nvy * nvy;
+        if (sp2 > maxSpeed2) {
+          const s = MAX_PARTICLE_SPEED / Math.sqrt(sp2);
+          nvx *= s;
+          nvy *= s;
+        }
+      }
+      vx[i] = nvx;
+      vy[i] = nvy;
+    }
+  }
+
+  private permuteFloat32(arr: Float32Array, order: Int32Array, n: number): void {
+    const tmp = this.permScratchF32;
+    for (let k = 0; k < n; k++) {
+      tmp[k] = arr[order[k]];
+    }
+    for (let k = 0; k < n; k++) {
+      arr[k] = tmp[k];
+    }
+  }
+
+  private reorderParticlesByCell(n: number): void {
+    const { sortedIdx, sortedX, sortedY } = this.spatialHash;
+    const { px, py, inCup, permScratchU8 } = this;
+
+    for (let k = 0; k < n; k++) {
+      px[k] = sortedX[k];
+      py[k] = sortedY[k];
+      permScratchU8[k] = inCup[sortedIdx[k]];
+    }
+    for (let k = 0; k < n; k++) {
+      inCup[k] = permScratchU8[k];
+    }
+
+    this.permuteFloat32(this.vx, sortedIdx, n);
+    this.permuteFloat32(this.vy, sortedIdx, n);
+    this.permuteFloat32(this.prevX, sortedIdx, n);
+    this.permuteFloat32(this.prevY, sortedIdx, n);
+    this.permuteFloat32(this.absR, sortedIdx, n);
+    this.permuteFloat32(this.absG, sortedIdx, n);
+    this.permuteFloat32(this.absB, sortedIdx, n);
+    this.permuteFloat32(this.fizz, sortedIdx, n);
+    this.permuteFloat32(this.baseFizz, sortedIdx, n);
+    this.permuteFloat32(this.life, sortedIdx, n);
+    this.permuteFloat32(this.w0, sortedIdx, n);
+    this.permuteFloat32(this.w1, sortedIdx, n);
+    this.permuteFloat32(this.w2, sortedIdx, n);
+    this.permuteFloat32(this.w3, sortedIdx, n);
+    this.permuteFloat32(this.w4, sortedIdx, n);
+
+    for (let k = 0; k < n; k++) {
+      sortedIdx[k] = k;
     }
   }
 

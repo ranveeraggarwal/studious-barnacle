@@ -66,12 +66,12 @@ export const GLASS_MAX_X = 760;
 export const GLASS_MIN_Y = TRAY_SURFACE_Y;
 export const GLASS_MAX_Y = 235;
 
-/** Fluid particle & bubble capacity constants */
-export const MAX_PARTICLES = 3200;
-export const GLASS_FULL_PARTICLES = 1120;
-export const PARTICLE_RADIUS = 4.6;
-export const KERNEL_RADIUS = 11.8;
-export const MAX_BUBBLES = 360;
+/** Fluid particle & bubble capacity constants (tuned for locked 60-120 FPS) */
+export const MAX_PARTICLES = 1800;
+export const GLASS_FULL_PARTICLES = 680;
+export const PARTICLE_RADIUS = 5.8;
+export const KERNEL_RADIUS = 14.8;
+export const MAX_BUBBLES = 280;
 
 export interface ViewportTransform {
   /** CSS width of canvas */

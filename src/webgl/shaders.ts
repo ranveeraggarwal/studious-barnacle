@@ -499,9 +499,9 @@ void main() {
   vec2 perp = vec2(-dir.y, dir.x);
 
   float streamStretch = smoothstep(42.0, 320.0, speed);
-  float baseRadius = 13.5;
-  float rAlong = baseRadius + streamStretch * 11.5;
-  float rPerp  = mix(baseRadius, 10.2, streamStretch * 0.62);
+  float baseRadius = 16.8;
+  float rAlong = baseRadius + 12.5 * streamStretch;
+  float rPerp  = mix(baseRadius, 11.5, streamStretch);
 
   vec2 worldPos = pos + dir * (aCorner.y * rAlong) + perp * (aCorner.x * rPerp);
 
@@ -514,8 +514,8 @@ void main() {
   vAbsRGB = aAbsFizz.rgb;
 
   // Normalize kernel weight so pooled glass interior hits optical depth ~1.4..1.85
-  // while airborne stream & splash droplets remain crisp and continuous above D=0.34
-  float particleWeight = mix(0.245, 0.43, smoothstep(30.0, 155.0, speed));
+  // while faster falling streams & splash droplets remain crisp and continuous above D=0.34
+  float particleWeight = mix(0.255, 0.44, smoothstep(40.0, 220.0, speed));
   vWeight = particleWeight * uSplatWriteScale;
 
   gl_PointSize = baseRadius * 2.0 * uPixelsPerWorld;
@@ -539,7 +539,7 @@ void main() {
 `;
 
   // ============================================================================
-  // PASS 3: 9-Tap Separable Gaussian Blur (~3.5 World Units Radius)
+  // PASS 3: 9-Tap Separable Gaussian Blur (~3.8 World Units Radius)
   // ============================================================================
   const blurFrag = `${fragHeader}
 uniform sampler2D uInputTex;

@@ -59,6 +59,20 @@ export class FountainRenderer {
   private splatFBO_B: OffscreenFBO | null = null;
   private fboWidth = 0;
   private fboHeight = 0;
+  private splatWidth = 0;
+  private splatHeight = 0;
+  private readonly maxTexSize: number;
+
+  // Static cache state for Pass 1 (bgFBO) so idle/settled frames cost 0.00 ms
+  private bgCacheDirty = true;
+  private cachedBgViewLeft = NaN;
+  private cachedBgViewRight = NaN;
+  private cachedBgViewBottom = NaN;
+  private cachedBgViewTop = NaN;
+  private cachedBgGlassX = NaN;
+  private cachedBgGlassY = NaN;
+  private cachedBgFill = NaN;
+  private readonly cachedBgNozzleActive = new Float32Array([-1, -1, -1, -1, -1]);
 
   private readonly nozzleXUniform = new Float32Array(5);
   private readonly nozzleRingColorUniform = new Float32Array(15);
@@ -78,7 +92,7 @@ export class FountainRenderer {
       depth: false,
       stencil: false,
       premultipliedAlpha: false,
-      preserveDrawingBuffer: true,
+      preserveDrawingBuffer: false,
     };
 
     const gl2 = canvas.getContext('webgl2', contextAttrs) as WebGL2RenderingContext | null;
@@ -97,6 +111,7 @@ export class FountainRenderer {
     }
 
     const gl = this.gl;
+    this.maxTexSize = (gl.getParameter(gl.MAX_TEXTURE_SIZE) as number) || 4096;
     this.instancing = getInstancingAdapter(gl, this.isWebGL2);
 
     const splatFormat = detectSplatFormat(gl, this.isWebGL2);
@@ -287,10 +302,11 @@ export class FountainRenderer {
   public resize(vp: ViewportTransform): void {
     if (this.disposed) return;
     const gl = this.gl;
-    const maxTexSize = (gl.getParameter(gl.MAX_TEXTURE_SIZE) as number) || 4096;
 
-    const targetW = Math.min(maxTexSize, Math.max(1, Math.round(vp.cssWidth * vp.dpr)));
-    const targetH = Math.min(maxTexSize, Math.max(1, Math.round(vp.cssHeight * vp.dpr)));
+    const targetW = Math.min(this.maxTexSize, Math.max(1, Math.round(vp.cssWidth * vp.dpr)));
+    const targetH = Math.min(this.maxTexSize, Math.max(1, Math.round(vp.cssHeight * vp.dpr)));
+    const splatW = Math.max(1, Math.round(targetW * 0.5));
+    const splatH = Math.max(1, Math.round(targetH * 0.5));
 
     if (this.canvas.width !== targetW || this.canvas.height !== targetH) {
       this.canvas.width = targetW;
@@ -300,6 +316,8 @@ export class FountainRenderer {
     if (
       this.fboWidth === targetW &&
       this.fboHeight === targetH &&
+      this.splatWidth === splatW &&
+      this.splatHeight === splatH &&
       this.bgFBO &&
       this.sceneFBO &&
       this.splatFBO_A &&
@@ -315,8 +333,8 @@ export class FountainRenderer {
 
     this.bgFBO = createOffscreenFBO(gl, this.isWebGL2, targetW, targetH, false);
     this.sceneFBO = createOffscreenFBO(gl, this.isWebGL2, targetW, targetH, false);
-    this.splatFBO_A = createOffscreenFBO(gl, this.isWebGL2, targetW, targetH, this.preferFloat16);
-    this.splatFBO_B = createOffscreenFBO(gl, this.isWebGL2, targetW, targetH, this.preferFloat16);
+    this.splatFBO_A = createOffscreenFBO(gl, this.isWebGL2, splatW, splatH, this.preferFloat16);
+    this.splatFBO_B = createOffscreenFBO(gl, this.isWebGL2, splatW, splatH, this.preferFloat16);
 
     if (this.splatFBO_A.isFloat && this.splatFBO_B.isFloat) {
       this.writeScale = 1.0;
@@ -328,6 +346,9 @@ export class FountainRenderer {
 
     this.fboWidth = targetW;
     this.fboHeight = targetH;
+    this.splatWidth = splatW;
+    this.splatHeight = splatH;
+    this.bgCacheDirty = true;
   }
 
   public render(
@@ -338,15 +359,17 @@ export class FountainRenderer {
     if (this.disposed) return;
 
     const gl = this.gl;
-    const expectedW = Math.max(1, Math.round(vp.cssWidth * vp.dpr));
-    const expectedH = Math.max(1, Math.round(vp.cssHeight * vp.dpr));
+    const expectedW = Math.min(this.maxTexSize, Math.max(1, Math.round(vp.cssWidth * vp.dpr)));
+    const expectedH = Math.min(this.maxTexSize, Math.max(1, Math.round(vp.cssHeight * vp.dpr)));
     if (
       !this.bgFBO ||
       !this.sceneFBO ||
       !this.splatFBO_A ||
       !this.splatFBO_B ||
-      (this.canvas.width !== expectedW && expectedW <= ((gl.getParameter(gl.MAX_TEXTURE_SIZE) as number) || 4096)) ||
-      (this.canvas.height !== expectedH && expectedH <= ((gl.getParameter(gl.MAX_TEXTURE_SIZE) as number) || 4096))
+      this.canvas.width !== expectedW ||
+      this.canvas.height !== expectedH ||
+      this.fboWidth !== expectedW ||
+      this.fboHeight !== expectedH
     ) {
       this.resize(vp);
     }
@@ -357,6 +380,8 @@ export class FountainRenderer {
     const splatB = this.splatFBO_B!;
     const width = this.fboWidth;
     const height = this.fboHeight;
+    const splatW = this.splatWidth;
+    const splatH = this.splatHeight;
 
     // Smoothly animate nozzle LED downlights & glass hover/drag rim brightening
     const dt =
@@ -373,6 +398,7 @@ export class FountainRenderer {
           0.86,
           this.nozzleActiveUniform[i] + (1.0 - this.nozzleActiveUniform[i]) * blendRate
         );
+        if (this.nozzleActiveUniform[i] > 0.998) this.nozzleActiveUniform[i] = 1.0;
       } else {
         this.nozzleActiveUniform[i] += (0.0 - this.nozzleActiveUniform[i]) * blendRate;
         if (this.nozzleActiveUniform[i] < 0.002) this.nozzleActiveUniform[i] = 0;
@@ -393,6 +419,7 @@ export class FountainRenderer {
     const viewSpanX = Math.max(1e-4, vp.viewRight - vp.viewLeft);
     const viewSpanY = Math.max(1e-4, vp.viewTop - vp.viewBottom);
     const pixelsPerWorld = vp.scale * vp.dpr;
+    const splatPixelsPerWorld = pixelsPerWorld * 0.5;
     const worldPerPixel = viewSpanX / Math.max(1, width);
     const worldToUvX = 1.0 / viewSpanX;
     const worldToUvY = 1.0 / viewSpanY;
@@ -417,29 +444,63 @@ export class FountainRenderer {
     gl.disable(gl.CULL_FACE);
     gl.disable(gl.SCISSOR_TEST);
     gl.colorMask(true, true, true, true);
-    gl.viewport(0, 0, width, height);
 
     // =========================================================================
-    // PASS 1: Render Procedural Studio & Soda Fountain Scene -> bgFBO
+    // PASS 1: Render Procedural Studio & Soda Fountain Scene -> bgFBO (Cached)
     // =========================================================================
-    gl.bindFramebuffer(gl.FRAMEBUFFER, bgFBO.fbo);
-    gl.disable(gl.BLEND);
+    const quantizedFill = Math.round(snapshot.mix.fillRatio * 50) * 0.02;
+    const glassDx = snapshot.glass.x - this.cachedBgGlassX;
+    const glassDy = snapshot.glass.y - this.cachedBgGlassY;
 
-    this.studioBgProg.use();
-    this.studioBgProg.set4f('uViewBounds', vp.viewLeft, vp.viewRight, vp.viewBottom, vp.viewTop);
-    this.studioBgProg.set1f('uWorldPerPixel', worldPerPixel);
-    this.studioBgProg.set2f('uGlassPos', snapshot.glass.x, snapshot.glass.y);
-    this.studioBgProg.set1f('uGlassFill', snapshot.mix.fillRatio);
-    this.studioBgProg.set1fv('uNozzleX', this.nozzleXUniform);
-    this.studioBgProg.set3fv('uNozzleRingColor', this.nozzleRingColorUniform);
-    this.studioBgProg.set3fv('uNozzleGlowColor', this.nozzleGlowColorUniform);
-    this.studioBgProg.set1fv('uNozzleActive', this.nozzleActiveUniform);
-    this.studioBgProg.set1f('uTime', snapshot.time);
+    let nozzlesChanged = false;
+    for (let i = 0; i < 5; i++) {
+      if (Math.abs(this.nozzleActiveUniform[i] - this.cachedBgNozzleActive[i]) > 0.002) {
+        nozzlesChanged = true;
+        break;
+      }
+    }
 
-    this.drawFullscreenQuad();
+    const needBgRender =
+      this.bgCacheDirty ||
+      this.cachedBgViewLeft !== vp.viewLeft ||
+      this.cachedBgViewRight !== vp.viewRight ||
+      this.cachedBgViewBottom !== vp.viewBottom ||
+      this.cachedBgViewTop !== vp.viewTop ||
+      !(glassDx * glassDx + glassDy * glassDy <= 0.15 * 0.15) ||
+      Math.abs(quantizedFill - this.cachedBgFill) > 0.001 ||
+      nozzlesChanged;
+
+    if (needBgRender) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, bgFBO.fbo);
+      gl.viewport(0, 0, width, height);
+      gl.disable(gl.BLEND);
+
+      this.studioBgProg.use();
+      this.studioBgProg.set4f('uViewBounds', vp.viewLeft, vp.viewRight, vp.viewBottom, vp.viewTop);
+      this.studioBgProg.set1f('uWorldPerPixel', worldPerPixel);
+      this.studioBgProg.set2f('uGlassPos', snapshot.glass.x, snapshot.glass.y);
+      this.studioBgProg.set1f('uGlassFill', quantizedFill);
+      this.studioBgProg.set1fv('uNozzleX', this.nozzleXUniform);
+      this.studioBgProg.set3fv('uNozzleRingColor', this.nozzleRingColorUniform);
+      this.studioBgProg.set3fv('uNozzleGlowColor', this.nozzleGlowColorUniform);
+      this.studioBgProg.set1fv('uNozzleActive', this.nozzleActiveUniform);
+      this.studioBgProg.set1f('uTime', snapshot.time);
+
+      this.drawFullscreenQuad();
+
+      this.bgCacheDirty = false;
+      this.cachedBgViewLeft = vp.viewLeft;
+      this.cachedBgViewRight = vp.viewRight;
+      this.cachedBgViewBottom = vp.viewBottom;
+      this.cachedBgViewTop = vp.viewTop;
+      this.cachedBgGlassX = snapshot.glass.x;
+      this.cachedBgGlassY = snapshot.glass.y;
+      this.cachedBgFill = quantizedFill;
+      this.cachedBgNozzleActive.set(this.nozzleActiveUniform);
+    }
 
     // =========================================================================
-    // PASS 2 & 3: Per-Particle Optical Splatting + 9-Tap Separable Blur
+    // PASS 2 & 3: Half-Res (0.5x) Optical Splatting + 9-Tap Separable Blur
     // =========================================================================
     const pCount = Math.min(
       snapshot.particleCount,
@@ -447,6 +508,7 @@ export class FountainRenderer {
     );
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, splatA.fbo);
+    gl.viewport(0, 0, splatW, splatH);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
@@ -463,14 +525,16 @@ export class FountainRenderer {
         vp.viewTop
       );
       this.particleSplatProg.set1f('uSplatWriteScale', this.writeScale);
-      this.particleSplatProg.set1f('uPixelsPerWorld', pixelsPerWorld);
+      this.particleSplatProg.set1f('uPixelsPerWorld', splatPixelsPerWorld);
 
       this.drawParticles(snapshot.particleData, pCount);
 
       gl.disable(gl.BLEND);
 
-      // 9-tap separable Gaussian blur with ~3.5 world units radius (4 * 0.875 = 3.5)
-      const blurTapWorld = 3.5 / 4.0;
+      // 9-tap separable Gaussian blur with ~3.8 world units radius relative to 1/splatW, 1/splatH
+      const blurTapTexels = (3.8 / 4.0) * splatPixelsPerWorld;
+      const invSplatW = 1.0 / splatW;
+      const invSplatH = 1.0 / splatH;
 
       // Pass 3a: Horizontal blur (splatFBO_A -> splatFBO_B)
       gl.bindFramebuffer(gl.FRAMEBUFFER, splatB.fbo);
@@ -480,7 +544,7 @@ export class FountainRenderer {
       this.blurProg.use();
       this.blurProg.set4f('uViewBounds', vp.viewLeft, vp.viewRight, vp.viewBottom, vp.viewTop);
       this.blurProg.set1i('uInputTex', 0);
-      this.blurProg.set2f('uBlurStep', blurTapWorld * worldToUvX, 0.0);
+      this.blurProg.set2f('uBlurStep', blurTapTexels * invSplatW, 0.0);
       this.drawFullscreenQuad();
 
       // Pass 3b: Vertical blur (splatFBO_B -> splatFBO_A)
@@ -488,7 +552,7 @@ export class FountainRenderer {
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, splatB.texture);
 
-      this.blurProg.set2f('uBlurStep', 0.0, blurTapWorld * worldToUvY);
+      this.blurProg.set2f('uBlurStep', 0.0, blurTapTexels * invSplatH);
       this.drawFullscreenQuad();
     }
 
@@ -496,6 +560,7 @@ export class FountainRenderer {
     // PASS 4A: Beer-Lambert Liquid Shading + Meniscus + Fizz Foam -> sceneFBO
     // =========================================================================
     gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFBO.fbo);
+    gl.viewport(0, 0, width, height);
     gl.disable(gl.BLEND);
 
     gl.activeTexture(gl.TEXTURE0);

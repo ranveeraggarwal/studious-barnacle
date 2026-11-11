@@ -16,6 +16,16 @@ export class SpatialHash {
   public readonly cellX: Int32Array;
   public readonly cellY: Int32Array;
 
+  // Contiguous CSR cell layout + dirty-cell tracking for fast cache-local scans
+  public readonly dirtyCells: Int32Array;
+  public dirtyCount = 0;
+  public readonly cellCount: Int32Array;
+  public readonly cellStart: Int32Array;
+  private readonly cellCursor: Int32Array;
+  public readonly sortedIdx: Int32Array;
+  public readonly sortedX: Float32Array;
+  public readonly sortedY: Float32Array;
+
   constructor(
     cellSize: number,
     maxParticles: number,
@@ -31,24 +41,65 @@ export class SpatialHash {
     this.cols = Math.max(1, Math.ceil((maxX - minX) * this.invCellSize));
     this.rows = Math.max(1, Math.ceil((maxY - minY) * this.invCellSize));
 
-    this.head = new Int32Array(this.cols * this.rows);
+    const totalCells = this.cols * this.rows;
+    this.head = new Int32Array(totalCells);
     this.head.fill(-1);
+    this.dirtyCells = new Int32Array(totalCells);
+    this.cellCount = new Int32Array(totalCells);
+    this.cellStart = new Int32Array(totalCells);
+    this.cellCursor = new Int32Array(totalCells);
+
     this.next = new Int32Array(maxParticles);
     this.cellX = new Int32Array(maxParticles);
     this.cellY = new Int32Array(maxParticles);
+    this.sortedIdx = new Int32Array(maxParticles);
+    this.sortedX = new Float32Array(maxParticles);
+    this.sortedY = new Float32Array(maxParticles);
   }
 
   public clear(): void {
-    this.head.fill(-1);
+    const { head, cellCount, dirtyCells, dirtyCount } = this;
+    for (let i = 0; i < dirtyCount; i++) {
+      const c = dirtyCells[i];
+      head[c] = -1;
+      cellCount[c] = 0;
+    }
+    this.dirtyCount = 0;
   }
 
   /**
-   * Rebuilds the linked-cell spatial index in O(count) with zero heap allocations.
+   * Rebuilds the spatial index in O(count) with zero heap allocations,
+   * resetting only the cells dirtied during the previous build and packing
+   * contiguous CSR slices (`sortedX`, `sortedY`, `sortedIdx`) per active cell.
    */
   public build(x: Float32Array, y: Float32Array, count: number): void {
-    const { head, next, cellX, cellY, minX, minY, invCellSize, cols, rows } = this;
-    head.fill(-1);
+    const {
+      head,
+      next,
+      cellX,
+      cellY,
+      dirtyCells,
+      cellCount,
+      cellStart,
+      cellCursor,
+      sortedIdx,
+      sortedX,
+      sortedY,
+      minX,
+      minY,
+      invCellSize,
+      cols,
+      rows,
+    } = this;
 
+    const prevDirty = this.dirtyCount;
+    for (let i = 0; i < prevDirty; i++) {
+      const c = dirtyCells[i];
+      head[c] = -1;
+      cellCount[c] = 0;
+    }
+
+    let dirtyCount = 0;
     const maxCol = cols - 1;
     const maxRow = rows - 1;
 
@@ -64,9 +115,32 @@ export class SpatialHash {
       cellY[i] = cy;
 
       const cellIdx = cy * cols + cx;
+      const prevCount = cellCount[cellIdx];
+      if (prevCount === 0) {
+        dirtyCells[dirtyCount++] = cellIdx;
+      }
+      cellCount[cellIdx] = prevCount + 1;
       next[i] = head[cellIdx];
       head[cellIdx] = i;
     }
+
+    let offset = 0;
+    for (let d = 0; d < dirtyCount; d++) {
+      const c = dirtyCells[d];
+      cellStart[c] = offset;
+      cellCursor[c] = offset;
+      offset += cellCount[c];
+    }
+
+    for (let i = 0; i < count; i++) {
+      const c = cellY[i] * cols + cellX[i];
+      const dst = cellCursor[c]++;
+      sortedIdx[dst] = i;
+      sortedX[dst] = x[i];
+      sortedY[dst] = y[i];
+    }
+
+    this.dirtyCount = dirtyCount;
   }
 
   /**
@@ -77,11 +151,12 @@ export class SpatialHash {
     qx: number,
     qy: number,
     radius: number,
-    x: Float32Array,
-    y: Float32Array,
+    _x: Float32Array,
+    _y: Float32Array,
     outIndices: Int32Array
   ): number {
-    const { head, next, minX, minY, invCellSize, cols, rows } = this;
+    const { cellCount, cellStart, sortedIdx, sortedX, sortedY, minX, minY, invCellSize, cols, rows } =
+      this;
     const r2 = radius * radius;
     const maxOut = outIndices.length;
 
@@ -99,15 +174,17 @@ export class SpatialHash {
     for (let cy = minCy; cy <= maxCy; cy++) {
       const rowOffset = cy * cols;
       for (let cx = minCx; cx <= maxCx; cx++) {
-        let j = head[rowOffset + cx];
-        while (j !== -1) {
-          const dx = x[j] - qx;
-          const dy = y[j] - qy;
+        const c = rowOffset + cx;
+        const cnt = cellCount[c];
+        if (cnt === 0) continue;
+        const end = cellStart[c] + cnt;
+        for (let k = cellStart[c]; k < end; k++) {
+          const dx = sortedX[k] - qx;
+          const dy = sortedY[k] - qy;
           if (dx * dx + dy * dy <= r2) {
-            outIndices[found++] = j;
+            outIndices[found++] = sortedIdx[k];
             if (found >= maxOut) return found;
           }
-          j = next[j];
         }
       }
     }

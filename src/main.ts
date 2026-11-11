@@ -61,15 +61,29 @@ function initApp(): void {
 
   let rafId = 0;
   let lastTimestamp = 0;
+  let accumulator = 0;
+  const FIXED_DT = 1 / 60;
+  const MAX_FRAME_DELTA = 0.085; // Allows up to ~5 catch-up steps before capping on tab switch
 
   const frame = (timestamp: number): void => {
-    const dt =
+    const frameDelta =
       lastTimestamp > 0
-        ? Math.min(Math.max((timestamp - lastTimestamp) / 1000, 1 / 240), 1 / 30)
-        : 1 / 60;
+        ? Math.min(Math.max((timestamp - lastTimestamp) / 1000, 0), MAX_FRAME_DELTA)
+        : FIXED_DT;
     lastTimestamp = timestamp;
+    accumulator += frameDelta;
 
-    sim.step(dt);
+    let steps = 0;
+    while (accumulator >= FIXED_DT * 0.85 && steps < 4) {
+      const stepDt = Math.min(accumulator, FIXED_DT);
+      sim.step(stepDt);
+      accumulator -= stepDt;
+      steps++;
+    }
+    if (steps === 4 && accumulator > FIXED_DT) {
+      accumulator = 0;
+    }
+
     const snapshot = sim.getSnapshot();
     ui.updateStatus(snapshot);
     renderer.render(snapshot, currentVp, ui.isGlassHovered());
